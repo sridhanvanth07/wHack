@@ -23,6 +23,14 @@ CANONICAL_FIELDS: dict[str, CanonicalFieldDefinition] = {
         description="Legal name or candidate full name",
         example="Aarav Mehta",
     ),
+    "first_name": CanonicalFieldDefinition(
+        name="first_name", semantic_type="person.name", fact_id="full_name", label="First name",
+        description="Given name derived from a verified full name; requires explicit review", example="Aarav",
+    ),
+    "last_name": CanonicalFieldDefinition(
+        name="last_name", semantic_type="person.name", fact_id="full_name", label="Last name",
+        description="Family name derived from a verified full name; requires explicit review", example="Mehta",
+    ),
     "email": CanonicalFieldDefinition(
         name="email",
         semantic_type="person.email",
@@ -78,6 +86,26 @@ CANONICAL_FIELDS: dict[str, CanonicalFieldDefinition] = {
         label="Permanent address",
         description="Permanent hometown address or permanent legal residence",
         example="44 Park Street, Mysuru",
+    ),
+    "education_institution": CanonicalFieldDefinition(
+        name="education_institution", semantic_type="education.institution", fact_id="education_institution",
+        label="Educational institution", description="University, college or school explicitly listed in the profile", example="Example University",
+    ),
+    "education_major": CanonicalFieldDefinition(
+        name="education_major", semantic_type="education.major", fact_id="education_major",
+        label="Course or major", description="Academic major or course of study", example="Computer Science",
+    ),
+    "linkedin_url": CanonicalFieldDefinition(
+        name="linkedin_url", semantic_type="professional.linkedin_url", fact_id="linkedin_url",
+        label="LinkedIn URL", description="Professional LinkedIn profile URL", example="https://www.linkedin.com/in/example",
+    ),
+    "github_url": CanonicalFieldDefinition(
+        name="github_url", semantic_type="professional.github_url", fact_id="github_url",
+        label="GitHub URL", description="GitHub profile URL", example="https://github.com/example",
+    ),
+    "portfolio_url": CanonicalFieldDefinition(
+        name="portfolio_url", semantic_type="professional.portfolio_url", fact_id="portfolio_url",
+        label="Portfolio URL", description="Professional portfolio or personal website URL", example="https://example.dev",
     ),
 }
 

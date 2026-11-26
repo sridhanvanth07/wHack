@@ -4,7 +4,7 @@ import json
 import re
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field
@@ -32,6 +32,11 @@ class FactCreateBody(BaseModel):
     purpose: str = "internship and job applications"
     user_confirmed: bool = True
     is_conflict: bool = False
+    source_type: Literal["manual", "resume", "resume_edited"] = "manual"
+    source_document_id: Optional[str] = Field(default=None, max_length=64)
+    source_section: Optional[str] = Field(default=None, max_length=100)
+    source_evidence: Optional[str] = Field(default=None, max_length=600)
+    extraction_confidence: Optional[float] = Field(default=None, ge=0, le=1)
 
 
 class FactUpdateBody(BaseModel):
@@ -187,8 +192,8 @@ def add_or_version_fact(c, body: FactCreateBody) -> dict[str, Any]:
         last_confirmed = now_iso if user_confirmed else None
 
     c.execute(
-        "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at, source_type, source_document_id, source_section, source_evidence, extraction_confidence, extracted_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             fid,
             fid,
@@ -204,6 +209,12 @@ def add_or_version_fact(c, body: FactCreateBody) -> dict[str, Any]:
             body.purpose,
             user_confirmed,
             last_confirmed,
+            body.source_type,
+            body.source_document_id,
+            body.source_section,
+            body.source_evidence,
+            body.extraction_confidence,
+            now_iso if body.source_type in {"resume", "resume_edited"} else None,
         ),
     )
 
@@ -247,8 +258,8 @@ def update_fact_value(c, fact_id: str, body: FactUpdateBody) -> dict[str, Any]:
         c.execute("UPDATE conflicts SET resolved=1,resolution_version=? WHERE fact_id=? AND resolved=0", (ver, fid))
 
     c.execute(
-        "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO facts(id, key, semantic_type, value, source_url, source_label, collected_at, version, confidence, verification, permitted_origins, purpose, user_confirmed, last_confirmed_at, source_type, source_document_id, source_section, source_evidence, extraction_confidence, extracted_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             fid,
             fid,
@@ -264,6 +275,12 @@ def update_fact_value(c, fact_id: str, body: FactUpdateBody) -> dict[str, Any]:
             purpose,
             user_confirmed,
             last_confirmed,
+            "manual_edit",
+            None,
+            None,
+            None,
+            None,
+            None,
         ),
     )
 

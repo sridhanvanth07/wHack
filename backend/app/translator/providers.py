@@ -69,6 +69,11 @@ class MockMappingProvider(BaseMappingProvider):
                 requires_user_confirmation=False,
             )
 
+        if re.search(r"\b(first|given)\s+name\b", norm):
+            return RawLLMResponse(canonical_field="first_name", confidence=0.94, explanation="First name is derived from the verified full name and should be reviewed.", requires_user_confirmation=True)
+        if re.search(r"\b(last|family|sur)\s*name\b|\bsurname\b", norm):
+            return RawLLMResponse(canonical_field="last_name", confidence=0.94, explanation="Last name is derived from the verified full name and should be reviewed.", requires_user_confirmation=True)
+
         # 4. Full Name (synonyms: full name, candidate name, applicant's legal name, name of candidate, etc.)
         name_patterns = [
             r"\b(candidate|applicant|student|legal|person|full)?\s*name\b",
@@ -102,12 +107,22 @@ class MockMappingProvider(BaseMappingProvider):
                 requires_user_confirmation=False,
             )
 
+        if "linkedin" in norm:
+            return RawLLMResponse(canonical_field="linkedin_url", confidence=0.98, explanation="LinkedIn profile URL.", requires_user_confirmation=False)
+        if "github" in norm:
+            return RawLLMResponse(canonical_field="github_url", confidence=0.98, explanation="GitHub profile URL.", requires_user_confirmation=False)
+        if any(w in norm for w in ["portfolio", "personal website", "website url"]):
+            return RawLLMResponse(canonical_field="portfolio_url", confidence=0.94, explanation="Professional website or portfolio URL.", requires_user_confirmation=False)
+        if any(w in norm for w in ["university", "institution", "college", "school"]):
+            return RawLLMResponse(canonical_field="education_institution", confidence=0.94, explanation="Educational institution.", requires_user_confirmation=False)
+        if re.search(r"\bmajor\b|\bfield of study\b|\bconcentration\b", norm):
+            return RawLLMResponse(canonical_field="education_major", confidence=0.91, explanation="Academic major or field of study.", requires_user_confirmation=False)
+
         # 7. Degree / Academic background
         degree_patterns = [
             r"\b(academic|educational)\s*(background|qualification|history)\b",
             r"\b(highest\s+)?qualification\b",
             r"\bdegree\b",
-            r"\bmajor\b",
             r"\bcourse\s+of\s+study\b",
             r"\bprogram\b",
         ]

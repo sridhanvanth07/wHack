@@ -6,9 +6,10 @@ import asyncio
 import logging
 import os
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
+from backend.app.preparation.security import UnsafeDestination, extract_https_origin, resolve_public_addresses, validate_public_https_url
 
 logger = logging.getLogger("carryflow.automation.manager")
 
@@ -20,8 +21,11 @@ ALLOWED_AUTOMATION_ORIGINS = {
 
 def is_allowed_origin(url: str) -> bool:
     try:
-        parsed = urlparse(url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
+        parsed = urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        port = parsed.port
+        origin = f"{parsed.scheme}://{parsed.hostname.lower()}" + (f":{port}" if port else "")
         return origin in ALLOWED_AUTOMATION_ORIGINS
     except Exception:
         return False
@@ -40,6 +44,21 @@ class PlaywrightManager:
         self._current_url: str = "about:blank"
         self._is_ready: bool = False
         self._error: str | None = None
+        self._approved_origins = set(ALLOWED_AUTOMATION_ORIGINS)
+        self._navigation_origin: str | None = None
+        self._pinned_host: str | None = None
+        self._pinned_ip: str | None = None
+        self._allow_document_navigation = False
+        self._expected_document_url: str | None = None
+        self._initial_document_seen = False
+        self._block_page_egress = False
+
+    def approve_origin(self, origin: str) -> None:
+        self._approved_origins.add(origin.rstrip("/").lower())
+
+    def lock_page_egress(self) -> None:
+        """Stop page-initiated requests before writing any Passport value into controls."""
+        self._block_page_egress = True
 
     @property
     def is_running(self) -> bool:
@@ -78,16 +97,42 @@ class PlaywrightManager:
                     slow_mo = 50
 
             try:
+                launch_args = []
+                if self._pinned_host and self._pinned_ip:
+                    launch_args.append(f"--host-resolver-rules=MAP {self._pinned_host} {self._pinned_ip},EXCLUDE localhost")
                 self._playwright = await async_playwright().start()
                 self._browser = await self._playwright.chromium.launch(
                     headless=headless,
                     slow_mo=slow_mo,
+                    args=launch_args,
                 )
                 self._context = await self._browser.new_context(
                     viewport={"width": 1280, "height": 800},
                     user_agent="CarryFlow-BrowserTaskAssistant/0.1.0",
+                    service_workers="block",
                 )
+                async def _block_websocket(websocket_route) -> None:
+                    await websocket_route.close(code=1008, reason="CarryFlow blocks WebSocket connections")
+                await self._context.route_web_socket("**/*", _block_websocket)
                 self._page = await self._context.new_page()
+                self._page.set_default_timeout(5_000)
+                self._page.set_default_navigation_timeout(15_000)
+                await self._page.add_init_script("""(() => {
+                  const block = e => { e.preventDefault(); e.stopImmediatePropagation(); };
+                  document.addEventListener('submit', block, true);
+                  HTMLFormElement.prototype.submit = function(){ throw new Error('CarryFlow blocks form submission'); };
+                  HTMLFormElement.prototype.requestSubmit = function(){ throw new Error('CarryFlow blocks form submission'); };
+                  window.fetch = () => Promise.reject(new Error('CarryFlow blocks page network actions'));
+                  const open = XMLHttpRequest.prototype.open;
+                  XMLHttpRequest.prototype.open = function(method, ...args) { if (!['GET','HEAD'].includes(String(method).toUpperCase())) throw new Error('CarryFlow blocks page write requests'); return open.call(this, method, ...args); };
+                  XMLHttpRequest.prototype.send = function(){ throw new Error('CarryFlow blocks page network actions'); };
+                  if (navigator.sendBeacon) navigator.sendBeacon = () => false;
+                  window.WebSocket = function(){ throw new Error('CarryFlow blocks page network actions'); };
+                  window.EventSource = function(){ throw new Error('CarryFlow blocks page network actions'); };
+                  window.RTCPeerConnection = function(){ throw new Error('CarryFlow blocks peer-to-peer network actions'); };
+                  if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = window.RTCPeerConnection;
+                })();""")
+                await self._context.route("**/*", self._guard_request)
                 self._current_url = self._page.url or "about:blank"
                 self._is_ready = True
                 self._error = None
@@ -135,6 +180,7 @@ class PlaywrightManager:
             self._playwright = None
 
         self._is_ready = False
+        self._block_page_egress = False
 
     async def get_page(self) -> Page:
         """Get active page or ensure one exists."""
@@ -146,13 +192,44 @@ class PlaywrightManager:
 
     async def navigate(self, url: str) -> dict[str, Any]:
         """Navigate active page to URL with strict origin enforcement."""
-        if not is_allowed_origin(url):
-            raise ValueError(f"Origin of URL '{url}' is outside approved local demo scope")
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme == "https":
+                origin = extract_https_origin(url)
+                if origin not in self._approved_origins:
+                    raise ValueError("Destination origin has not been explicitly approved.")
+                origin, url = validate_public_https_url(url)
+                host, addresses = await asyncio.to_thread(resolve_public_addresses, url)
+                if self._pinned_host != host or self._pinned_ip not in addresses:
+                    await self.stop()
+                    self._pinned_host, self._pinned_ip = host, addresses[0]
+                    if not await self.start():
+                        raise ValueError("Could not start a browser pinned to the verified public destination address.")
+            elif is_allowed_origin(url):
+                origin = f"{parsed.scheme}://{parsed.hostname.lower()}" + (f":{parsed.port}" if parsed.port else "")
+            else:
+                raise ValueError("Only explicitly approved HTTPS origins and local demo origins can be opened.")
+        except (UnsafeDestination, ValueError) as exc:
+            raise ValueError(str(exc)) from exc
+        if origin not in self._approved_origins:
+            raise ValueError("Destination origin has not been explicitly approved.")
 
         page = await self.get_page()
         async with self._lock:
-            response = await page.goto(url, wait_until="domcontentloaded")
+            self._navigation_origin = origin
+            self._block_page_egress = False
+            self._allow_document_navigation = True
+            self._expected_document_url = url
+            self._initial_document_seen = False
+            try:
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
+            finally:
+                self._allow_document_navigation = False
             self._current_url = page.url
+            final = urlsplit(self._current_url)
+            final_origin = f"{final.scheme}://{final.hostname}" + (f":{final.port}" if final.port else "")
+            if final_origin.lower() != origin:
+                raise ValueError("Navigation redirected outside the approved destination origin.")
             try:
                 self._latest_screenshot = await page.screenshot(type="png", full_page=False)
             except Exception as err:
@@ -164,6 +241,34 @@ class PlaywrightManager:
                 "url": self._current_url,
                 "status_code": status_code,
             }
+
+    async def _guard_request(self, route) -> None:
+        """Keep all browser egress on the explicitly approved public HTTPS origin."""
+        try:
+            request_url = route.request.url
+            parsed = urlsplit(request_url)
+            origin = f"{parsed.scheme}://{parsed.hostname}" + (f":{parsed.port}" if parsed.port else "")
+            if self._navigation_origin is None or origin.lower() != self._navigation_origin:
+                raise ValueError("Cross-origin browser requests are blocked.")
+            if route.request.method.upper() not in {"GET", "HEAD"}:
+                raise ValueError("Browser write requests are blocked; CarryFlow does not submit applications.")
+            if self._block_page_egress:
+                raise ValueError("Page network requests are blocked while approved values are being prepared.")
+            if route.request.is_navigation_request() and route.request.resource_type == "document":
+                if not self._allow_document_navigation:
+                    raise ValueError("Page-initiated navigation and form submission are blocked.")
+                if route.request.redirected_from is None:
+                    if self._initial_document_seen or request_url != self._expected_document_url:
+                        raise ValueError("Page-initiated navigation and form submission are blocked.")
+                    self._initial_document_seen = True
+            if parsed.scheme == "https":
+                await asyncio.to_thread(validate_public_https_url, request_url)
+            elif not is_allowed_origin(request_url):
+                raise ValueError("Unsupported browser request scheme.")
+            await route.continue_()
+        except Exception as exc:
+            logger.info("Blocked browser request: %s", exc)
+            await route.abort("blockedbyclient")
 
     async def capture_screenshot(self) -> bytes:
         """Capture screenshot of the current page."""

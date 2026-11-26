@@ -18,10 +18,14 @@ wHack/
 │   │   │   ├── schema.py        # Pydantic schemas (MappingResult, RawLLMResponse)
 │   │   │   ├── service.py       # FieldTranslator (validation, hallucination guard)
 │   │   │   └── __init__.py
-│   │   └── automation/          # Phase 4: Playwright Browser Automation
-│   │       ├── manager.py       # PlaywrightManager (Chromium lifecycle, origin guard)
-│   │       ├── automator.py     # FormAutomator (inspect, fill, observe — never submits)
-│   │       └── __init__.py
+│   │   ├── automation/          # Shared Playwright browser and form automation
+│   │   │   ├── manager.py       # PlaywrightManager (Chromium lifecycle, origin guard)
+│   │   │   ├── automator.py     # FormAutomator (inspect, fill, observe — never submits)
+│   │   │   └── __init__.py
+│   │   └── preparation/         # Phase 5: saved-opportunity application preparation
+│   │       ├── security.py      # HTTPS/DNS destination checks
+│   │       ├── schemas.py       # typed review, state, and receipt models
+│   │       └── service.py       # origin approvals and preparation workflow
 │   └── tests/
 │       ├── test_carryflow.py    # 9 core workflow tests
 │       ├── test_translator.py   # 12 AI field translator tests
@@ -99,6 +103,14 @@ uvicorn backend.app.main:app --reload
 
 Open **http://127.0.0.1:8000** in your browser.
 
+The chat tab can also search internship listings. Remotive works without credentials; optional Adzuna India results require server-side `ADZUNA_APP_ID` and `ADZUNA_APP_KEY`. See [docs/DISCOVERY.md](docs/DISCOVERY.md) for source coverage, attribution, and limits.
+
+Save search results from their cards or use the **Saved** dashboard tab to manage listings, application statuses, history, deadlines, and private notes. See [docs/OPPORTUNITY_TRACKING.md](docs/OPPORTUNITY_TRACKING.md) for storage and API details.
+
+Use the **Resume** tab to upload a PDF or DOCX resume (up to 8 MB), review evidence-backed extracted items, edit them, and accept selected facts into Smart Passport. Files are processed in memory and discarded; scanned PDFs require OCR and are not supported. See [docs/PASSPORT_RESUME_INTELLIGENCE.md](docs/PASSPORT_RESUME_INTELLIGENCE.md) for privacy, parsing, provenance, and API details.
+
+In **Saved**, choose **Prepare application** to preview a saved listing destination, explicitly approve its origin, inspect form fields, review Passport mappings, and prepare only approved fields in the existing Playwright browser. Passport sharing permission for each external origin is a separate action. Submission, credentials, CAPTCHA/MFA, and resume-file upload are not automated. See [docs/APPLICATION_PREPARATION.md](docs/APPLICATION_PREPARATION.md) for the security model and endpoints.
+
 ---
 
 ##  Running Tests
@@ -114,7 +126,7 @@ Open **http://127.0.0.1:8000** in your browser.
 .\.venv\Scripts\pytest -v --tb=long
 ```
 
-**Current test status:** 31 passing tests across 4 suites.
+**Current verification:** 126 passing tests and 3 skipped browser-dependent checks; the live browser end-to-end suite is run separately.
 
 ---
 
@@ -143,17 +155,19 @@ Open **http://127.0.0.1:8000** in your browser.
 | `BROWSER_MODE` | `playwright` | `playwright` or `iframe` |
 | `PLAYWRIGHT_HEADLESS` | `true` | Run Chromium headless |
 | `PLAYWRIGHT_SLOWMO` | `50` | Slow-mo ms for Playwright |
+| `ADZUNA_APP_ID` | _(empty)_ | Optional Adzuna app ID for India internship search |
+| `ADZUNA_APP_KEY` | _(empty)_ | Optional Adzuna app key; keep server-side |
 
 ---
 
 ##  Security Design
 
-- Only two approved local origins (`http://127.0.0.1:8000`, `http://localhost:8000`) are allowed.
+- Synthetic demo origins remain local-only. Application origins require separate, exact HTTPS approval and public DNS validation.
 - Unconfirmed facts are **never** auto-shared with any portal.
 - Ambiguous fields (e.g. generic "Location") are always held for user review.
 - LLM output is validated against a strict canonical field allowlist — hallucinated fields are rejected.
 - The final submission button is **never** clicked automatically.
-- No real personal data is used anywhere (synthetic Aarav Mehta profile only).
+- External application fields receive Passport data only after fact-level sharing permission and explicit mapping and preparation approval.
 
 ---
 
@@ -166,7 +180,7 @@ Open **http://127.0.0.1:8000** in your browser.
 | AI Field Translator | Rule-based mock + LLM (Gemini/OpenAI/Anthropic) |
 | Browser Automation | Playwright (async, Chromium) |
 | Data Model | Versioned facts with provenance, semantic types, permissions |
-| Test Suite | pytest (31 tests, no external dependencies) |
+| Test Suite | pytest (unit, integration, policy, and synthetic portal fixture coverage) |
 
 See `docs/ARCHITECTURE.md` for the full design.
 
@@ -175,3 +189,10 @@ See `docs/ARCHITECTURE.md` for the full design.
 ##  License
 
 MIT — Hackathon MVP. Synthetic data only.
+# Persistent workflows
+
+Phase 6 adds backend-persisted career workflow goals, checkpoints, activity history, pause/resume/cancel, and user decision endpoints around the existing fixed tool registry. See [docs/WORKFLOWS.md](docs/WORKFLOWS.md) for the state model, APIs, recovery behavior, and current limits.
+
+## Phase 7 hardening
+
+Phase 7 adds workflow session scoping, stale-decision rejection, credential redaction in workflow text, saved-listing revalidation before preparation recovery/fill, and stronger browser request restrictions. See [docs/PHASE_7_HARDENING.md](docs/PHASE_7_HARDENING.md) for the audit, tests, results, and known limitations.

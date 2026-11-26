@@ -24,17 +24,32 @@ carryflow.db-shm
 carryflow.db-wal
 carryflow.db-*
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
 
 # ── Secrets & Environment ─────────────────────────────────
 .env
+*.env.*
+!.env.example
 *.env.local
 *.env.production
 
 # ── Playwright ────────────────────────────────────────────
 playwright-report/
 test-results/
+playwright/.auth/
+browser-profile/
+browser-profiles/
+user-data-dir/
+*.har
+*.trace
+*.webm
 
 # ── OS ────────────────────────────────────────────────────
 .DS_Store
@@ -44,6 +59,15 @@ desktop.ini
 # ── Logs ─────────────────────────────────────────────────
 *.log
 logs/
+*.dmp
+*.dump
+*.tmp
+*.temp
+*.bak
 
 # ── Node (if any tooling is added later) ─────────────────
 node_modules/
+
+# ── IDE and editor-local files ────────────────────────────
+*.code-workspace
+.idea/

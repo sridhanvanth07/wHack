@@ -1,4 +1,5 @@
 import asyncio
+import os
 import threading
 import time
 import uvicorn
@@ -21,6 +22,7 @@ def live_server():
     yield
 
 
+@pytest.mark.skipif(os.environ.get("CARRYFLOW_PLAYWRIGHT_DISABLED", "").lower() in {"1", "true", "yes"}, reason="Playwright browser execution is disabled in this environment")
 def test_complete_priority_workflow_with_playwright():
     main.init()
     main.reset()

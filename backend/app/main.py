@@ -15,12 +15,34 @@ from dotenv import load_dotenv
 # Load configuration from .env if present
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import File, UploadFile
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from backend.app.automation import FormAutomator, get_playwright_manager
+from backend.app.conversation import ChatRequest, ChatResponse, handle_message
+from backend.app.opportunities.schemas import (
+    ApplicationStatus, NoteCreateRequest, NoteUpdateRequest, OpportunityNote, OperationResult,
+    SaveOpportunityRequest, SavedOpportunityList, SavedOpportunityRecord, SavedOpportunityResult,
+    StatusHistoryList, StatusUpdateRequest,
+)
+from backend.app.opportunities.service import OpportunityNotFound, OpportunityService, init_schema as init_opportunity_schema
+from backend.app.preparation.schemas import (
+    FieldReviewRequest, OpportunityPreview, OriginApproval, OriginApprovalRequest,
+    PreparationApprovalRequest, PreparationList, PreparationReceipt, PreparationResult,
+    PreparationStartRequest,
+)
+from backend.app.preparation.security import UnsafeDestination, extract_https_origin, validate_public_https_url
+from backend.app.preparation.service import PreparationError, PreparationService, init_schema as init_preparation_schema
+from backend.app.resumes.schemas import (
+    ResumeDeleteResult, ResumeDetail, ResumeItem, ResumeItemUpdate, ResumeList,
+    ResumeReviewRequest, ResumeReviewResult, ResumeUploadResult,
+)
+from backend.app.resumes.service import ResumeInputError, ResumeService, init_schema as init_resume_schema
+from backend.app.workflows import WorkflowError, WorkflowService, init_schema as init_workflow_schema
+from backend.app.workflows.schemas import WorkflowCreate, WorkflowDecision
 
 from backend.app.translator import (
     CANONICAL_FIELDS,
@@ -98,6 +120,10 @@ def init() -> None:
         CREATE TABLE IF NOT EXISTS conflicts(id TEXT PRIMARY KEY, fact_id TEXT, old_version INTEGER, new_version INTEGER, resolved INTEGER DEFAULT 0, resolution_version INTEGER);
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
         """)
+        init_opportunity_schema(c)
+        init_resume_schema(c)
+        init_preparation_schema(c)
+        init_workflow_schema(c)
         # Upgrade schema if needed
         info = c.execute("PRAGMA table_info(facts)").fetchall()
         if not next((col[5] for col in info if col[1] == "version"), 0):
@@ -111,6 +137,18 @@ def init() -> None:
         action_columns = {col[1] for col in c.execute("PRAGMA table_info(actions)")}
         if "preconditions" not in action_columns:
             c.execute("ALTER TABLE actions ADD COLUMN preconditions TEXT NOT NULL DEFAULT '{}'")
+        fact_columns = {col[1] for col in c.execute("PRAGMA table_info(facts)")}
+        fact_additions = {
+            "source_type": "TEXT NOT NULL DEFAULT 'manual'",
+            "source_document_id": "TEXT",
+            "source_section": "TEXT",
+            "source_evidence": "TEXT",
+            "extraction_confidence": "REAL",
+            "extracted_at": "TEXT",
+        }
+        for column, definition in fact_additions.items():
+            if column not in fact_columns:
+                c.execute(f"ALTER TABLE facts ADD COLUMN {column} {definition}")
         c.execute("INSERT OR IGNORE INTO meta VALUES('workflow_id',?)", (str(uuid.uuid4()),))
         c.execute("INSERT OR IGNORE INTO meta VALUES('status','PENDING')")
         c.execute("INSERT OR IGNORE INTO meta VALUES('current_origin','http://127.0.0.1:8000/portal/source')")
@@ -194,7 +232,7 @@ def portal(which: str) -> str:
 
 
 @app.get("/api/state")
-def state() -> dict[str, Any]:
+def state(session_id: str | None = None) -> dict[str, Any]:
     with db() as c:
         facts = [dict(r) for r in c.execute("SELECT * FROM facts ORDER BY key,version")]
         events = [dict(r) for r in c.execute("SELECT * FROM events ORDER BY created_at DESC LIMIT 40")]
@@ -202,7 +240,8 @@ def state() -> dict[str, Any]:
         actions = [dict(r) for r in c.execute("SELECT * FROM actions ORDER BY created_at DESC")]
         conflicts = [dict(r) for r in c.execute("SELECT * FROM conflicts WHERE resolved=0")]
         meta = dict(c.execute("SELECT key,value FROM meta"))
-    return {"facts": facts, "events": events, "receipts": receipts, "actions": actions, "conflicts": conflicts, "meta": meta, "portals": PORTALS}
+    return {"facts": facts, "events": events, "receipts": receipts, "actions": actions, "conflicts": conflicts, "meta": meta, "portals": PORTALS,
+            "preparations": preparation_service().list(), "agent_workflows": WorkflowService(db).list(session_id)[:10] if session_id else []}
 
 
 # --- Smart Personal Data Passport Endpoints ---
@@ -240,6 +279,19 @@ def confirm_passport_fact(fact_id: str, body: FactConfirmBody | None = None) -> 
 
 @app.post("/api/passport/fact/{fact_id}/permissions")
 def update_passport_permissions(fact_id: str, body: FactPermissionsBody) -> dict[str, Any]:
+    checked_origins = []
+    for value in body.permitted_origins:
+        if value in ALLOWED:
+            checked_origins.append(value)
+            continue
+        try:
+            origin, normalized = validate_public_https_url(value.rstrip("/") + "/")
+        except UnsafeDestination as exc:
+            raise HTTPException(422, f"Invalid sharing origin: {exc}") from exc
+        if normalized != origin + "/" or value.rstrip("/").lower() != origin:
+            raise HTTPException(422, "Sharing permissions must contain exact HTTPS origins without paths.")
+        checked_origins.append(origin)
+    body.permitted_origins = sorted(set(checked_origins))
     with db() as c:
         res = update_fact_permissions(c, fact_id, body)
         event(c, "passport", f"Permissions updated for '{fact_id}'", f"Origins allowed: {', '.join(body.permitted_origins)}.")
@@ -249,6 +301,7 @@ def update_passport_permissions(fact_id: str, body: FactPermissionsBody) -> dict
 @app.post("/api/reset")
 def reset() -> dict[str, bool]:
     with db() as c:
+        c.execute("UPDATE resume_items SET review_status='EXTRACTED',passport_fact_id=NULL,passport_version=NULL,review_error=NULL WHERE review_status IN ('USER_VERIFIED','CONFLICT_PENDING')")
         for t in ("facts", "events", "receipts", "actions", "conflicts"):
             c.execute(f"DELETE FROM {t}")
         c.execute("UPDATE meta SET value=? WHERE key='workflow_id'", (str(uuid.uuid4()),))
@@ -288,6 +341,417 @@ def semantic_for(label: str) -> str:
 def translate_field(body: TranslateBody) -> MappingResult:
     """Direct field translation endpoint using Intelligent Field Translator."""
     return get_translator().translate(label=body.label, description=body.description)
+
+
+@app.post("/api/chat", response_model=ChatResponse)
+def chat(body: ChatRequest) -> ChatResponse:
+    """Interpret a supported conversational request and run a policy-checked tool."""
+    return handle_message(body)
+
+
+def workflow_service() -> WorkflowService:
+    return WorkflowService(db)
+
+
+@app.post("/api/workflows")
+def create_agent_workflow(body: WorkflowCreate) -> dict[str, Any]:
+    try:
+        return workflow_service().create(body.goal, body.session_id)
+    except WorkflowError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/workflows")
+def list_agent_workflows(session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    return {"workflows": workflow_service().list(session_id)}
+
+
+@app.get("/api/workflows/{workflow_id}")
+def get_agent_workflow(workflow_id: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    try:
+        return workflow_service().get_owned(workflow_id, session_id)
+    except WorkflowError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/workflows/{workflow_id}/history")
+def get_agent_workflow_history(workflow_id: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    item = get_agent_workflow(workflow_id, session_id)
+    return {"activity": item["activity"]}
+
+
+@app.get("/api/workflows/{workflow_id}/activity")
+def get_agent_workflow_activity(workflow_id: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    return get_agent_workflow_history(workflow_id, session_id)
+
+
+@app.get("/api/workflows/{workflow_id}/checkpoints")
+def get_agent_workflow_checkpoints(workflow_id: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    item = get_agent_workflow(workflow_id, session_id)
+    return {"checkpoints": item["checkpoints"]}
+
+
+@app.get("/api/workflows/{workflow_id}/next-step")
+def get_agent_workflow_next_step(workflow_id: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    item = get_agent_workflow(workflow_id, session_id)
+    action = item["pending_action"] or ("Continue with the next supported workflow step." if item["status"] in {"RUNNING", "PARTIALLY_COMPLETED"} else "Wait for your decision or resume this workflow.")
+    return {"workflow_id": workflow_id, "status": item["status"], "recommendation": action}
+
+
+@app.get("/api/workflow-approvals/pending")
+def get_pending_workflow_approvals(session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    return {"workflows": [w for w in workflow_service().list(session_id) if w["status"] == "WAITING_FOR_APPROVAL"]}
+
+
+@app.post("/api/workflows/{workflow_id}/{action}")
+def transition_agent_workflow(workflow_id: str, action: str, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    try:
+        workflow_service().get_owned(workflow_id, session_id)
+        return workflow_service().transition(workflow_id, action)
+    except WorkflowError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workflows/{workflow_id}/decisions")
+def ask_agent_workflow_decision(workflow_id: str, body: WorkflowDecision, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    try:
+        workflow_service().get_owned(workflow_id, session_id)
+        return workflow_service().ask(workflow_id, body.decision)
+    except WorkflowError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/workflows/{workflow_id}/decisions/{decision_id}/respond")
+def respond_agent_workflow_decision(workflow_id: str, decision_id: str, body: WorkflowDecision, session_id: str = Query(min_length=1, max_length=64)) -> dict[str, Any]:
+    try:
+        workflow_service().get_owned(workflow_id, session_id)
+        return workflow_service().respond(workflow_id, decision_id, body.decision)
+    except WorkflowError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def opportunity_service() -> OpportunityService:
+    return OpportunityService(db)
+
+
+def resume_service() -> ResumeService:
+    return ResumeService(db)
+
+
+def preparation_service() -> PreparationService:
+    return PreparationService(db)
+
+
+def _preparation_facts() -> list[dict[str, Any]]:
+    with db() as c:
+        return [dict(row) for row in get_current_facts(c).values()]
+
+
+def _revalidate_preparation_opportunity(preparation: dict[str, Any]) -> None:
+    try:
+        saved = opportunity_service().get_saved(preparation["opportunity_id"])
+        origin, destination = validate_public_https_url(saved["opportunity"]["listing_url"])
+    except (OpportunityNotFound, UnsafeDestination, ValueError) as exc:
+        raise PreparationError("The saved opportunity is no longer available or its destination is invalid. Save and review it again before continuing.", 409) from exc
+    if origin != preparation["origin"] or destination != preparation["destination_url"]:
+        raise PreparationError("The saved opportunity destination changed. Preview it and start a new preparation review.", 409)
+
+
+@app.get("/api/preparations/origins")
+def list_preparation_origins() -> dict[str, Any]:
+    return {"origins": preparation_service().approved_origins()}
+
+
+@app.post("/api/preparations/origins/approve", response_model=OriginApproval)
+def approve_preparation_origin(body: OriginApprovalRequest) -> dict[str, Any]:
+    try:
+        origin, normalized = validate_public_https_url(body.origin)
+    except UnsafeDestination as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if normalized.rstrip("/") != origin or body.origin.rstrip("/").lower() != origin:
+        raise HTTPException(422, "Approve the exact HTTPS origin only; paths and URL credentials are not allowed here.")
+    saved = preparation_service().approve_origin(origin)
+    get_playwright_manager().approve_origin(origin)
+    with db() as c:
+        event(c, "origin_approval", "Application origin approved", f"User explicitly approved {origin} for controlled application preparation.")
+    return saved
+
+
+@app.get("/api/preparations/preview/{opportunity_id}", response_model=OpportunityPreview)
+def preview_preparation(opportunity_id: str) -> dict[str, Any]:
+    try:
+        record = opportunity_service().get_saved(opportunity_id)
+        origin, destination_url = validate_public_https_url(record["opportunity"]["listing_url"])
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ValueError, UnsafeDestination) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    item = record["opportunity"]
+    return {"opportunity_id": record["id"], "title": item["title"], "company_name": item.get("company_name"),
+            "destination_url": destination_url, "origin": origin, "origin_approved": preparation_service().origin_is_approved(origin)}
+
+
+@app.post("/api/preparations/start", response_model=PreparationResult)
+async def start_preparation(body: PreparationStartRequest) -> dict[str, Any]:
+    try:
+        record = opportunity_service().get_saved(body.opportunity_id)
+        origin, destination_url = validate_public_https_url(record["opportunity"]["listing_url"])
+        workflow = preparation_service().create(record["id"], record["opportunity"], destination_url, origin)
+        manager = get_playwright_manager()
+        manager.approve_origin(origin)
+        nav = await manager.navigate(destination_url)
+        if not nav.get("ok") or nav.get("url", "").split("/", 3)[:3] != destination_url.split("/", 3)[:3]:
+            raise PreparationError("The application page did not remain on its approved origin.", 403)
+        inspected = await FormAutomator.inspect_fields(await manager.get_page())
+        result = preparation_service().set_inspection(workflow["id"], inspected["fields"], _preparation_facts(), get_translator(), origin, excluded_count=inspected["excluded_count"])
+        return {"preparation": result}
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (UnsafeDestination, PreparationError) as exc:
+        raise HTTPException(getattr(exc, "status_code", 422), str(exc)) from exc
+    except Exception as exc:
+        if "workflow" in locals():
+            preparation_service().fail(workflow["id"], "Browser navigation or inspection failed; no fields were prepared.")
+        raise HTTPException(502, "Could not safely open or inspect the application page.") from exc
+
+
+@app.get("/api/preparations", response_model=PreparationList)
+def list_preparations() -> dict[str, Any]:
+    return {"preparations": preparation_service().list()}
+
+
+@app.get("/api/preparations/{preparation_id}", response_model=PreparationResult)
+def get_preparation(preparation_id: str) -> dict[str, Any]:
+    try:
+        return {"preparation": preparation_service().get(preparation_id)}
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.put("/api/preparations/{preparation_id}/fields/{field_id}/review", response_model=PreparationResult)
+def review_preparation_field(preparation_id: str, field_id: str, body: FieldReviewRequest) -> dict[str, Any]:
+    try:
+        result = preparation_service().review_field(preparation_id, field_id, body.decision, body.fact_id, _preparation_facts(), preparation_service().get(preparation_id)["origin"])
+        return {"preparation": result}
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.post("/api/preparations/{preparation_id}/approve", response_model=PreparationResult)
+def approve_preparation(preparation_id: str, body: PreparationApprovalRequest) -> dict[str, Any]:
+    try:
+        return {"preparation": preparation_service().approve(preparation_id, body.approved, _preparation_facts())}
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.post("/api/preparations/{preparation_id}/fill", response_model=PreparationResult)
+async def fill_preparation(preparation_id: str) -> dict[str, Any]:
+    service = preparation_service()
+    manager = get_playwright_manager()
+    try:
+        state = service.get(preparation_id)
+        _revalidate_preparation_opportunity(state)
+        if not service.origin_is_approved(state["origin"]):
+            raise PreparationError("Destination origin is no longer approved.", 403)
+        page = await manager.get_page()
+        inspected = await FormAutomator.inspect_fields(page)
+        current_facts = _preparation_facts()
+        state, values, approved = service.fill_plan(preparation_id, page.url, inspected["fields"], current_facts)
+        manager.lock_page_egress()
+        outcome = await FormAutomator.fill_fields(page, values, {field_id: field["fingerprint"] for field_id, field in approved.items()})
+        names = {field_id: field["label"] for field_id, field in approved.items()}
+        receipt = {
+            "id": str(uuid.uuid4()), "workflow_id": state["id"], "opportunity_id": state["opportunity_id"],
+            "origin": state["origin"], "prepared_at": NOW(), "detected_field_count": len(state["fields"]),
+            "approved_mapping_count": len(approved), "successfully_filled_fields": [names[key] for key in outcome["filled"] if key in names],
+            "skipped_fields": [field["label"] for field in state["fields"] if field["mapping_status"] != "APPROVED"],
+            "permission_blocked_fields": [field["label"] for field in state["fields"] if field["mapping_status"] == "PERMISSION_BLOCKED"],
+            "ambiguous_fields": [field["label"] for field in state["fields"] if field["mapping_status"] == "AMBIGUOUS"],
+            "failed_fields": {names.get(key, key): value for key, value in outcome["errors"].items()},
+            "recovery_state": "PARTIALLY_PREPARED" if outcome["errors"] else "PREPARED",
+            "user_approval_reference": state.get("approval_reference"),
+        }
+        try:
+            await manager.capture_screenshot()
+        except Exception:
+            pass
+        status = "PARTIALLY_PREPARED" if outcome["errors"] else "PREPARED"
+        result = service.save_receipt(preparation_id, receipt, status)
+        with db() as c:
+            event(c, "handoff", "Application preparation receipt created", f"{len(receipt['successfully_filled_fields'])} field(s) prepared; {len(receipt['failed_fields'])} failed. Application was not submitted.")
+        return {"preparation": result}
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "The browser could not complete preparation safely.") from exc
+
+
+@app.get("/api/preparations/{preparation_id}/receipt", response_model=PreparationReceipt)
+def get_preparation_receipt(preparation_id: str) -> dict[str, Any]:
+    try:
+        receipt = preparation_service().get(preparation_id).get("receipt")
+        if not receipt:
+            raise PreparationError("A handoff receipt is not available until field preparation has run.", 404)
+        return receipt
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+
+
+@app.post("/api/preparations/{preparation_id}/recover", response_model=PreparationResult)
+async def recover_preparation(preparation_id: str) -> dict[str, Any]:
+    service = preparation_service()
+    try:
+        state = service.get(preparation_id)
+        _revalidate_preparation_opportunity(state)
+        if not service.origin_is_approved(state["origin"]):
+            raise PreparationError("Destination origin must be reapproved before recovery.", 403)
+        manager = get_playwright_manager()
+        manager.approve_origin(state["origin"])
+        await manager.navigate(state["destination_url"])
+        inspected = await FormAutomator.inspect_fields(await manager.get_page())
+        result = service.set_inspection(preparation_id, inspected["fields"], _preparation_facts(), get_translator(), state["origin"], recovery=True, excluded_count=inspected["excluded_count"])
+        return {"preparation": result}
+    except PreparationError as exc:
+        raise HTTPException(exc.status_code, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, "Recovery could not safely reopen and inspect the approved page.") from exc
+
+
+@app.post("/api/resumes/upload", response_model=ResumeUploadResult)
+async def upload_resume(file: UploadFile = File(...)) -> dict[str, Any]:
+    try:
+        content = await file.read(8 * 1024 * 1024 + 1)
+        if len(content) > 8 * 1024 * 1024:
+            raise ResumeInputError("Resume files must be 8 MB or smaller.")
+        return resume_service().upload(file.filename, content)
+    except ResumeInputError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    finally:
+        await file.close()
+
+
+@app.get("/api/resumes", response_model=ResumeList)
+def list_resumes() -> dict[str, Any]:
+    return {"resumes": resume_service().list_resumes()}
+
+
+@app.get("/api/resumes/{resume_id}", response_model=ResumeDetail)
+def get_resume(resume_id: str) -> dict[str, Any]:
+    return resume_service().get_resume(resume_id)
+
+
+@app.put("/api/resumes/{resume_id}/items/{item_id}", response_model=ResumeItem)
+def update_resume_item(resume_id: str, item_id: str, body: ResumeItemUpdate) -> dict[str, Any]:
+    return resume_service().update_item(resume_id, item_id, body)
+
+
+@app.post("/api/resumes/{resume_id}/approve", response_model=ResumeReviewResult)
+def approve_resume_items(resume_id: str, body: ResumeReviewRequest) -> dict[str, Any]:
+    result = resume_service().approve_items(resume_id, body.item_ids)
+    if any(item.get("review_status") in {"USER_VERIFIED", "CONFLICT_PENDING"} for item in result["items"]):
+        with db() as c:
+            event(c, "passport", "Resume facts reviewed", f"{sum(item.get('review_status') == 'USER_VERIFIED' for item in result['items'])} fact(s) verified; conflicts remain for explicit resolution.")
+    return result
+
+
+@app.post("/api/resumes/{resume_id}/reject", response_model=ResumeReviewResult)
+def reject_resume_items(resume_id: str, body: ResumeReviewRequest) -> dict[str, Any]:
+    return resume_service().reject_items(resume_id, body.item_ids)
+
+
+@app.delete("/api/resumes/{resume_id}", response_model=ResumeDeleteResult)
+def delete_resume(resume_id: str) -> dict[str, Any]:
+    deleted = resume_service().delete_resume(resume_id)
+    if not deleted:
+        raise HTTPException(404, "Resume not found")
+    return {"deleted": True}
+
+
+@app.post("/api/opportunities/save", response_model=SavedOpportunityResult)
+def save_opportunity(body: SaveOpportunityRequest) -> dict[str, Any]:
+    try:
+        record, created = opportunity_service().save_from_context(body.session_id, body.opportunity_id)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"opportunity": record, "created": created}
+
+
+@app.get("/api/opportunities/saved", response_model=SavedOpportunityList)
+def list_saved_opportunities(status: ApplicationStatus | None = None, sort_by_deadline: bool = False) -> dict[str, Any]:
+    return {"opportunities": opportunity_service().list_saved(status, sort_by_deadline)}
+
+
+@app.get("/api/opportunities/saved/{opportunity_id}", response_model=SavedOpportunityRecord)
+def get_saved_opportunity(opportunity_id: str) -> dict[str, Any]:
+    try:
+        return opportunity_service().get_saved(opportunity_id)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/opportunities/saved/{opportunity_id}", response_model=OperationResult)
+def remove_saved_opportunity(opportunity_id: str) -> dict[str, Any]:
+    try:
+        removed = opportunity_service().remove(opportunity_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not removed:
+        raise HTTPException(404, "Saved opportunity not found.")
+    return {"removed": True}
+
+
+@app.put("/api/opportunities/saved/{opportunity_id}/status", response_model=SavedOpportunityRecord)
+def update_saved_opportunity_status(opportunity_id: str, body: StatusUpdateRequest) -> dict[str, Any]:
+    try:
+        return opportunity_service().update_status(opportunity_id, body.status)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/opportunities/history", response_model=StatusHistoryList)
+def get_opportunity_history(opportunity_id: str | None = None, company: str | None = None) -> dict[str, Any]:
+    try:
+        return {"history": opportunity_service().history(opportunity_id, company)}
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/opportunities/saved/{opportunity_id}/notes", response_model=OpportunityNote)
+def create_opportunity_note(opportunity_id: str, body: NoteCreateRequest) -> dict[str, Any]:
+    try:
+        return opportunity_service().add_note(opportunity_id, body.note)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.put("/api/opportunities/saved/{opportunity_id}/notes/{note_id}", response_model=OpportunityNote)
+def update_opportunity_note(opportunity_id: str, note_id: str, body: NoteUpdateRequest) -> dict[str, Any]:
+    try:
+        return opportunity_service().update_note(opportunity_id, note_id, body.note)
+    except OpportunityNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/opportunities/saved/{opportunity_id}/notes/{note_id}", response_model=OperationResult)
+def delete_opportunity_note(opportunity_id: str, note_id: str) -> dict[str, Any]:
+    try:
+        deleted = opportunity_service().delete_note(opportunity_id, note_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not deleted:
+        raise HTTPException(404, "Note not found for this opportunity.")
+    return {"deleted": True}
 
 
 @app.post("/api/prepare/{portal_key}")
@@ -389,6 +853,11 @@ def resolve(body: ResolveBody) -> dict[str, Any]:
         c.execute("UPDATE facts SET verification='USER_CONFIRMED',user_confirmed=1,last_confirmed_at=? WHERE id=? AND version=?", (now_iso, body.fact_id, body.version))
         c.execute("UPDATE facts SET verification='SUPERSEDED' WHERE id=? AND version!=? AND verification='UNVERIFIED_CONFLICT'", (body.fact_id, body.version))
         c.execute("UPDATE conflicts SET resolved=1,resolution_version=? WHERE fact_id=? AND resolved=0", (body.version, body.fact_id))
+        c.execute(
+            "UPDATE resume_items SET review_status=CASE WHEN passport_version=? THEN 'USER_VERIFIED' ELSE 'REJECTED' END,review_error=NULL "
+            "WHERE passport_fact_id=? AND review_status='CONFLICT_PENDING'",
+            (body.version, body.fact_id),
+        )
         event(c, "approval", "Conflict resolved", f"User selected {row['source_label']} version {body.version}; previous versions retained.")
     return state()
 
@@ -499,7 +968,7 @@ def submit_approve() -> dict[str, Any]:
 # --- Playwright Real Browser Automation Endpoints ---
 
 class AutomationNavigateBody(BaseModel):
-    url: str
+    url: str = Field(min_length=8, max_length=2048)
 
 
 @app.get("/api/automation/status")
@@ -529,8 +998,14 @@ async def automation_navigate(body: AutomationNavigateBody) -> dict[str, Any]:
     """Navigate Playwright browser to an approved portal URL."""
     mgr = get_playwright_manager()
     try:
+        if body.url.startswith("https://"):
+            origin = extract_https_origin(body.url)
+            if not preparation_service().origin_is_approved(origin):
+                raise ValueError("Destination origin has not been explicitly approved.")
+            validate_public_https_url(body.url)
+            mgr.approve_origin(origin)
         res = await mgr.navigate(body.url)
-    except ValueError as e:
+    except (ValueError, UnsafeDestination) as e:
         raise HTTPException(403, str(e))
     except Exception as e:
         raise HTTPException(500, f"Navigation failed: {e}")
